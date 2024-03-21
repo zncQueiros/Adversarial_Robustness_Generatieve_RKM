@@ -1,50 +1,91 @@
 import torch
 import os
 import time
-from model import net3
+import copy
+import numpy as np
+from torch.autograd import Variable
+
+from dataloader import get_mnist_dataloader
 
 device = torch.device("cpu")
 
 h_dim = 10
 
-# Define centered Kernel matrix
-def kPCA(X):
-    a = torch.mm(X, torch.t(X))
-    nh1 = X.size(0)
-    oneN = torch.div(torch.ones(nh1, nh1), nh1).to(device)
-    return a - torch.mm(oneN, a) - torch.mm(a, oneN) + torch.mm(torch.mm(oneN, a), oneN)  # kernel centering
-    # da = torch.diag(1 / torch.sqrt(torch.diag(a)))
-    # a = torch.mm(torch.mm(da, a), da)
-    # print('condition number: ', np.linalg.cond(a.cpu().detach().numpy()))
+class create_dirs:
+    """ Creates directories for Checkpoints and saving trained models """
+
+    def __init__(self, ct):
+        self.ct = ct
+        self.dircp = 'checkpoint.pth_{}.tar'.format(self.ct)
+        self.dirout = 'Mul_trained_RKM_{}.tar'.format(self.ct)
+
+    def create(self):
+        if not os.path.exists('cp/'):
+            os.makedirs('cp/')
+
+        if not os.path.exists('out/'):
+            os.makedirs('out/')
+
+    def save_checkpoint(self, state, is_best):
+        if is_best:
+            torch.save(state, 'cp/{}'.format(self.dircp))
 
 
-# Define initial loss
-def h1_loss(op1, X):
-    a = kPCA(op1)
-    h1, s1, _ = torch.linalg.svd(a)  # we want full matrix
-    h1 = h1[:, : h_dim]
-    U = torch.mm(torch.t(op1), h1)
+def adv_train(X, y, model, criterion, adversary):
+    """
+    Adversarial training. Returns pertubed mini batch.
+    """
 
-    x_tilde = net3(torch.mm(h1, torch.t(U)))
+    # If adversarial training, need a snapshot of
+    # the model at each batch to compute grad, so
+    # as not to mess up with the optimization step
+    model_cp = copy.deepcopy(model)
+    for p in model_cp.parameters():
+        p.requires_grad = False
+    model_cp.eval()
 
-    # Cost
-    f1 = torch.trace(torch.mm(torch.mm(op1, U), torch.t(h1)))
-    f2 = 0.5 * s1[0] * torch.trace(torch.mm(h1, torch.t(h1)))
-    f3 = 0.5 * (torch.trace(torch.mm(torch.t(U), U)))
-    recon_loss2 = torch.nn.MSELoss(reduction='sum')
-    f4 = recon_loss2(x_tilde.view(-1, 784), X.view(-1, 784)) / X.size(0)
+    adversary.model = model_cp
 
-    loss = - f1 + f3 + f2 + 0.5 * (- f1 + f2 + f3) ** 2 + 100 * f4  # Stabilized loss
-    return loss, f4, h1, s1, U, a
+    X_adv = adversary.perturb(X.numpy(), y)
 
-
-ct = time.strftime("%Y%m%d-%H%M")
-dircp = 'checkpoint.pth_{}.tar'.format(ct)
-
-if not os.path.exists('cp/'):
-    os.makedirs('cp/')
+    return torch.from_numpy(X_adv)
 
 
-def save_checkpoint(state, is_best, filename='cp/{}'.format(dircp)):
-    if is_best:
-        torch.save(state, filename)
+def final_compute(args, net1, net2, kPCA, device=torch.device('cuda')):
+    """ Function to compute embeddings of full dataset. """
+    args.shuffle = False
+    xt, _, _ = get_mnist_dataloader(args=args)  # loading data without shuffle
+    xtr = net1(xt.dataset.train_data[:args.N, :, :, :].to(args.device))
+    ytr = net2(xt.dataset.targets[:args.N, :].to(args.device))
+
+    h, s = kPCA(xtr, ytr)
+    return torch.mm(torch.t(xtr), h), torch.mm(torch.t(ytr), h), h, s
+
+
+def truncated_normal(mean=0.0, stddev=1.0, m=1):
+    '''
+    The generated values follow a normal distribution with specified
+    mean and standard deviation, except that values whose magnitude is
+    more than 2 standard deviations from the mean are dropped and
+    re-picked. Returns a vector of length m
+    '''
+    samples = []
+    for i in range(m):
+        while True:
+            sample = np.random.normal(mean, stddev)
+            if np.abs(sample) <= 2 * stddev:
+                break
+        samples.append(sample)
+    assert len(samples) == m, "something wrong"
+    if m == 1:
+        return samples[0]
+    else:
+        return np.array(samples)
+
+
+def pred_batch(x, model):
+    """
+    batch prediction helper
+    """
+    y_pred = np.argmax(model(Variable(x)).data.cpu().numpy(), axis=1)
+    return torch.from_numpy(y_pred)
