@@ -1,11 +1,12 @@
 import copy
 import numpy as np
-from collections import Iterable
+# from collections import Iterable
 from scipy.stats import truncnorm
 
 import torch
 import torch.nn as nn
 from torch.autograd import Variable
+
 
 # --- White-box attacks ---
 
@@ -44,46 +45,50 @@ class FGSMAttack(object):
 
 
 class LinfPGDAttack(object):
-    def __init__(self, model=None, epsilon=0.3, k=40, a=0.01,
-        random_start=True):
+    def __init__(self, model=None, epsilon=0.1, k=40, a=0.01, amount=50, random_start=True, device=None):
         """
-        Attack parameter initialization. The attack performs k steps of
-        size a, while always staying within epsilon from the initial
-        point.
+        Attack parameter initialization. The attack performs of
+        size a with amount of 50, while always staying within epsilon
+        from the initial point.
         https://github.com/MadryLab/mnist_challenge/blob/master/pgd_attack.py
         """
         self.model = model
         self.epsilon = epsilon
         self.k = k
         self.a = a
+        self.amount = amount
         self.rand = random_start
-        self.loss_fn = nn.CrossEntropyLoss()
+        self.device = device
+        self.loss_fn = nn.MSELoss()
 
-    def perturb(self, X_nat, y):
+    def perturb(self, X_nat):
         """
         Given examples (X_nat, y), returns adversarial
         examples within epsilon of X_nat in l_infinity norm.
         """
-        if self.rand:
-            X = X_nat + np.random.uniform(-self.epsilon, self.epsilon,
-                X_nat.shape).astype('float32')
-        else:
-            X = np.copy(X_nat)
+        X_nat = X_nat.to(self.device).float()
 
-        for i in range(self.k):
-            X_var = Variable(torch.from_numpy(X), requires_grad=True)
-            y_var = Variable(torch.LongTensor(y))
+        if self.rand:
+            X = X_nat + torch.from_numpy(
+                np.random.uniform(-self.epsilon, self.epsilon, X_nat.shape).astype('float32')).to(self.device)
+        else:
+            X = X_nat.clone()
+
+        # for i in range(self.k):
+        it = 1
+        while torch.norm(X - X_nat).item() < self.amount and it < self.k:
+            X_var = Variable(X, requires_grad=True)
 
             scores = self.model(X_var)
-            loss = self.loss_fn(scores, y_var)
+            loss = self.loss_fn(scores, X_var)
             loss.backward()
-            grad = X_var.grad.data.cpu().numpy()
+            grad = X_var.grad.data
 
-            X += self.a * np.sign(grad)
+            X = X + self.a * torch.sign(grad)
 
-            X = np.clip(X, X_nat - self.epsilon, X_nat + self.epsilon)
-            X = np.clip(X, 0, 1) # ensure valid pixel range
-
+            X = torch.max(torch.min(X, X_nat + self.epsilon), X_nat - self.epsilon)
+            X = torch.clamp(X, 0, 1)  # ensure valid pixel range
+            it += 1
         return X
 
 
@@ -123,7 +128,7 @@ def jacobian_augmentation(model, X_sub_prev, Y_sub, lmbda=0.1):
         grad_val = np.sign(grad)
 
         # Create new synthetic point in adversary substitute training set
-        X_sub[len(X_sub_prev)+ind] = X_sub[ind] + lmbda * grad_val #???
+        X_sub[len(X_sub_prev) + ind] = X_sub[ind] + lmbda * grad_val  # ???
 
     # Return augmented training data (needs to be labeled afterwards)
     return X_sub

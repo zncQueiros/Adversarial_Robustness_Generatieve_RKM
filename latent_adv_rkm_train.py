@@ -1,0 +1,229 @@
+import argparse
+import math
+import time
+from datetime import datetime
+
+import matplotlib.pyplot as plt
+
+from attack import LinfPGDAttack
+from utils import *
+
+os.environ["TORCH_METAL_ENABLED"] = "1"
+torch.autograd.set_detect_anomaly(False)
+
+# Model Settings =================================================================================================
+parser = argparse.ArgumentParser(description='Gen-RKM Model')
+
+parser.add_argument('--dataset_name', type=str, default='mnist',
+                    help='Dataset name: mnist/fashion-mnist/svhn/dsprites/3dshapes/cars3d')
+parser.add_argument('--N', type=int, default=5000, help='Total # of samples')
+parser.add_argument('--mb_size', type=int, default=100, help='Mini-batch size. See utils.py')
+parser.add_argument('--h_dim', type=int, default=128, help='Dim of latent vector')
+parser.add_argument('--capacity', type=int, default=32, help='Capacity of network. See utils.py')
+parser.add_argument('--x_fdim', type=int, default=128, help='Input x_fdim. See utils.py')
+parser.add_argument('--c_accu', type=float, default=100, help='Input weight on recons_error')
+
+# Training Settings =============================
+parser.add_argument('--lr', type=float, default=1e-4, help='Input learning rate for optimizer')
+parser.add_argument('--max_epochs', type=int, default=200, help='Input max_epoch for cut-off')
+parser.add_argument('--delay', type=int, default=10, help='Start adversarial training after delay')
+parser.add_argument('--device', type=str, default='mps', help='Device type: cuda|cpu|mps')
+parser.add_argument('--workers', type=int, default=0, help='# of workers for dataloader')
+parser.add_argument('--shuffle', type=bool, default=True, help='shuffle dataset: true or false')
+parser.add_argument('--adv', type=str, default=True, help='adv|cln: adv training or not')
+parser.add_argument('--pert', type=float, default=30, help='the amount of perturbation')
+
+opt = parser.parse_args()
+# ============================================================================================
+
+# load raw data===============================================================================
+ct = time.strftime("%Y%m%d-%H%M")
+dirs = create_dirs(opt.dataset_name)
+dirs.create()
+
+# Load Training Data
+xtrain, ipVec_dim, nChannels = get_dataloader(args=opt)
+
+
+train_loss = []
+validation_loss = []
+
+
+# Define and compute Kernel Matrices
+def kPCA(X):
+    a = torch.mm(X, torch.t(X))
+    nh1 = a.size(0)
+    oneN = torch.div(torch.ones(nh1, nh1), nh1).float().to(opt.device)
+    a = a - torch.mm(oneN, a) - torch.mm(a, oneN) + torch.mm(torch.mm(oneN, a), oneN)  # centering
+    h, s, _ = torch.linalg.svd(a, full_matrices=False)
+    return h[:, :opt.h_dim], s
+
+
+class Model(nn.Module):
+    def __init__(self, Encoder, Decoder):
+        super(Model, self).__init__()
+        self.Encoder = Encoder
+        self.Decoder = Decoder
+
+    def forward(self, x, h=None):
+        output = self.Encoder(x)
+        if h is None:
+            h, _ = kPCA(output)
+        U = torch.mm(torch.t(output), h)
+
+        x_tilde = self.Decoder(torch.mm(h, torch.t(U)))
+
+        return x_tilde
+
+
+def rkm_loss(output_, h_=None):
+    global s_
+    if h_ is None:
+        h_, s_ = kPCA(output_)
+    U_ = torch.mm(torch.t(output_), h_)
+
+    # Costs
+    f1 = torch.trace(torch.mm(torch.mm(output_, U_), torch.t(h_)))
+    f2 = 0.5 * torch.trace(torch.mm(h_, torch.mm(torch.diag(s_[:opt.h_dim]), torch.t(h_))))
+    f3 = 0.5 * (torch.trace(torch.mm(torch.t(U_), U_)))
+    loss = - f1 + f3 + f2 + 0.5 * (- f1 + f3 + f2) ** 2
+    return loss
+
+
+def latent_attack(model_, x, eta=1e-5, n_iter=15):
+    model_.Encoder.zero_grad()
+    model_.Decoder.zero_grad()
+    optimizer.zero_grad()
+
+    # Forward pass
+    x_adv_ori = x.clone().detach()
+    output_ = model.Encoder(x)
+    # output_var = Variable(output, requires_grad=True)  # Ensure output requires gradients for backward pass
+    h_, _ = kPCA(output_)
+    U_ = torch.mm(torch.t(output_), h_)
+    h_ori = h_.reshape(-1, 100).T
+    h_adv = h_ori.clone().detach().requires_grad_(True)
+
+    for i in range(n_iter):
+        h_adv = h_adv.clone().detach().requires_grad_(True)
+        loss_value = -torch.linalg.vector_norm(model_.Decoder(model_.Encoder(model_.Decoder(torch.mm(h_adv, torch.t(U_))))) - x_adv_ori) \
+                     + 500 * nn.ReLU()(0.1 - torch.linalg.vector_norm(h_adv - h_ori))
+        loss_value.backward(retain_graph=True)  # 1.0
+        h_adv = h_adv - eta * h_adv.grad
+
+    return h_adv
+
+
+# Initialize Feature/Pre-image maps
+net1 = Net1().float().to(opt.device)
+net3 = Net3().float().to(opt.device)
+
+model = Model(Encoder=net1, Decoder=net3)
+params = list(model.Encoder.parameters()) + list(model.Decoder.parameters())
+optimizer = torch.optim.Adam(params, lr=opt.lr, weight_decay=0)
+recon_loss = torch.nn.MSELoss()
+
+# Train ===============================================================================
+l_cost = 6  # Costs from where checkpoints will be saved
+t = 1
+cost = np.inf  # Initialize cost
+start = datetime.now()
+while cost > 0.2 and t <= opt.max_epochs:  # run epochs until convergence
+    avg_loss = 0
+    avg_loss_val = 0
+    for i, (datax, _) in enumerate(xtrain):
+        if i < math.ceil(opt.N / opt.mb_size):
+            datax = datax.to(opt.device)
+            output = model.Encoder(datax)
+            recon = recon_loss(datax.view(-1, ipVec_dim), model.forward(datax).view(-1, ipVec_dim))
+            loss = rkm_loss(output) + opt.c_accu * recon
+            if t > opt.delay and opt.adv:
+                h_adv = latent_attack(model, datax)
+                recon = recon_loss(datax.view(-1, ipVec_dim), model.forward(datax, h_adv).view(-1, ipVec_dim))
+                adv_loss = rkm_loss(output, h_=h_adv) + opt.c_accu * recon
+                loss = (loss + adv_loss) / 2
+
+            optimizer.zero_grad()
+            loss.backward(retain_graph=True)
+            optimizer.step()
+            avg_loss += loss.detach().cpu().numpy()
+
+        elif i < math.ceil(opt.N / opt.mb_size) + 10:  # 10 minibatch size for the validation
+            datax = datax.to(opt.device)
+            output = model.Encoder(datax)
+            recon = recon_loss(datax.view(-1, ipVec_dim), model.forward(datax).view(-1, ipVec_dim))
+            loss = rkm_loss(output) + opt.c_accu * recon
+            if t > opt.delay and opt.adv:
+                h_adv = latent_attack(model, datax)
+                recon = recon_loss(datax.view(-1, ipVec_dim), model.forward(datax, h=h_adv).view(-1, ipVec_dim))
+                adv_loss = rkm_loss(output, h_=h_adv) + opt.c_accu * recon
+                loss = (loss + adv_loss) / 2
+
+            avg_loss_val += loss.detach().cpu().numpy()
+
+        else:
+            break
+    cost = avg_loss
+
+    train_loss.append(avg_loss)
+    validation_loss.append(avg_loss_val)
+
+    # Remember the lowest cost and save checkpoint
+    is_best = cost < l_cost
+    l_cost = min(cost, l_cost)
+
+    dirs.save_checkpoint({
+        'epochs': t + 1,
+        'net1_state_dict': model.Encoder.state_dict(),
+        'net3_state_dict': model.Decoder.state_dict(),
+        'l_cost': l_cost,
+        'optimizer': optimizer.state_dict()}, is_best)
+    print(t, cost)
+    t += 1
+print('Finished Training in: {}. Lowest cost: {}'.format(str(datetime.now() - start), l_cost))
+
+if os.path.exists('cp/{}'.format(dirs.dircp)):
+    sd_mdl = torch.load('cp/{}'.format(dirs.dircp))
+    model.Encoder.load_state_dict(sd_mdl['net1_state_dict'])
+    model.Decoder.load_state_dict(sd_mdl['net3_state_dict'])
+
+
+# opt.shuffle = False
+# xt, _, _ = get_dataloader(args=opt)  # loading data without shuffle
+# xtr = net1(xt.dataset.train_data[:opt.N, :, :, :].to(opt.device))
+# h = latent_attack(model, xt.dataset.train_data[:opt.N, :, :, :].to(opt.device))
+# _, s = kPCA(xtr)
+# U = torch.mm(torch.t(xtr), h)
+
+U, h, s = final_compute(opt, model.Encoder, kPCA)
+
+
+# Save Model =============
+torch.save({'net1': model.Encoder,
+            'net3': model.Decoder,
+            'net1_state_dict': model.Encoder.state_dict(),
+            'net3_state_dict': model.Decoder.state_dict(),
+            'h': h,
+            'opt': opt, 's': s, 'U': U}, 'out/{}'.format(dirs.dirout))
+
+# Plot the curves
+plt.semilogy(range(len(train_loss)), train_loss, color='red', label='Training loss')
+plt.semilogy(range(len(validation_loss)), validation_loss, color='blue', label='Validation loss')
+
+# Add labels and title
+plt.xlabel('Number of epochs')
+plt.ylabel('Loss (log-scale)')
+plt.title('Training and validation loss for the training of the latent adversarial genRKM')
+
+# Add legend
+plt.legend()
+
+# Show the plot
+plt.grid(True)
+plt.show()
+
+train_loss_array = np.array(train_loss)
+validation_loss_array = np.array(validation_loss)
+
+np.save('Training_curves/train_curve_advgeRKM_200epo_noLinLay.npy', train_loss_array)
+np.save('Training_curves/validation_curve_advgeRKM_200epo_noLinLay.npy', validation_loss_array)
